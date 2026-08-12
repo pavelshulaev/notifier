@@ -186,8 +186,8 @@ class rover_notifier extends CModule
             'EMAIL_TO'   => $email,
             'SUBJECT'    => '#HOST#: #MESSAGE#',
             'BODY_TYPE'  => 'text',
-            'MESSAGE'    => "Message: #MESSAGE# (#CODE#)\r\n\r\nFile: #FILE#, line #LINE#\r\n\r\n" .
-                "Count: #COUNT#\r\nDate: #DATE#\r\n\r\nTrace:\r\n#TRACE#",
+            'MESSAGE'    => "Message: #MESSAGE# (#CODE#)\r\n\r\nSource: #SOURCE#\r\nType: #LOG_TYPE#\r\n" .
+                "File: #FILE#, line #LINE#\r\n\r\nCount: #COUNT#\r\nDate: #DATE#\r\n\r\nTrace:\r\n#TRACE#",
         ]);
     }
 
@@ -219,7 +219,7 @@ class rover_notifier extends CModule
         $template->set('ACTIVE', false);
         $template->set('SENDER', '#DEFAULT_SENDER#');
         $template->set('RECEIVER', '+7XXXXXXXXXX');
-        $template->set('MESSAGE', '#HOST#: #MESSAGE# (#FILE#:#LINE#), x#COUNT#');
+        $template->set('MESSAGE', '#HOST# [#SOURCE#/#LOG_TYPE#]: #MESSAGE# (#FILE#:#LINE#), x#COUNT#');
 
         $template->addToSites(SiteTable::getEntity()->wakeUpObject($lid));
 
@@ -262,8 +262,40 @@ class rover_notifier extends CModule
      */
     public function installDb(): void
     {
-        if (!ErrorTable::getEntity()->getConnection()->isTableExists(ErrorTable::getTableName())) {
+        $connection = ErrorTable::getEntity()->getConnection();
+        $tableName  = ErrorTable::getTableName();
+
+        if (!$connection->isTableExists($tableName)) {
             ErrorTable::getEntity()->createDbTable();
+
+            return;
+        }
+
+        // таблица осталась от прежней версии (при удалении отмечали "оставить") - добавляем
+        // колонки, появившиеся в более поздних версиях модуля
+        $columns = array_change_key_case($connection->getTableFields($tableName), CASE_UPPER);
+        $added   = [
+            'DATA'   => 'TEXT',
+            'SOURCE' => 'VARCHAR(255)',
+            'CODE'   => 'VARCHAR(50)',
+        ];
+
+        foreach ($added as $column => $definition) {
+            if (array_key_exists($column, $columns)) {
+                continue;
+            }
+
+            try {
+                $connection->query('ALTER TABLE ' . $connection->getSqlHelper()->quote($tableName) .
+                    ' ADD ' . $connection->getSqlHelper()->quote($column) . ' ' . $definition);
+            } catch (\Throwable $e) {
+                // getTableFields() кеширует список колонок на время запроса, поэтому проверка
+                // выше может опираться на устаревшие данные. Колонка уже есть - это не ошибка
+                // установки, всё остальное пробрасываем наверх
+                if (!str_contains($e->getMessage(), 'uplicate column')) {
+                    throw $e;
+                }
+            }
         }
     }
 

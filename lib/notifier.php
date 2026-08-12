@@ -5,9 +5,13 @@ namespace Rover\Notifier;
 use Bitrix\Main\Context;
 use Bitrix\Main\Diag\ExceptionHandlerLog;
 use Bitrix\Main\Loader;
+use Bitrix\Main\Localization\Loc;
 use Bitrix\Main\SiteTable;
 use Bitrix\Main\Type\DateTime;
+use Bitrix\Main\Web\Json;
 use Throwable;
+
+Loc::loadMessages(__FILE__);
 
 /**
  * Class Notifier
@@ -29,51 +33,101 @@ class Notifier
     const SMS_EVENT_NAME = 'ROVER_NOTIFIER_ERROR_SMS';
 
     /**
+     * Поля, которые модуль формирует сам; всё остальное из $context считается
+     * произвольными плейсхолдерами шаблона и переживает очередь группировки в колонке DATA.
+     */
+    const RESERVED_FIELDS = [
+        'MESSAGE', 'CODE', 'FILE', 'LINE', 'TRACE', 'LOG_TYPE', 'SOURCE', 'HOST', 'COUNT', 'DATE'
+    ];
+
+    /**
      * @param Throwable $exception
      * @param mixed     $logType
+     * @param array     $context
      * @return void
      * @author Pavel Shulaev (https://rover-it.me)
      */
-    public static function handle(Throwable $exception, $logType = ''): void
+    public static function handle(Throwable $exception, $logType = '', array $context = []): void
     {
         if (!Options::isGroupingEnabled() || static::isCriticalLogType($logType)) {
-            static::notify($exception, $logType);
+            static::notify($exception, $logType, $context);
             return;
         }
 
-        static::enqueue($exception, $logType);
+        static::enqueue($exception, $logType, $context);
     }
 
     /**
-     * Публичный API для стороннего кода (сайтовые обработчики, другие модули): шлёт
-     * сообщение немедленно, минуя очередь группировки, независимо от настроек модуля.
+     * Публичный API для стороннего кода (сайтовые обработчики, другие модули).
+     * Сообщение проходит по тем же правилам, что и перехваченные ошибки: если перехват
+     * выключен - не отправляется вовсе, если включена группировка - копится в очереди.
      * Перед вызовом нужно подключить модуль: Loader::includeModule('rover.notifier').
      *
      * @param Throwable|string $messageOrException готовое исключение либо произвольный текст
      * @param array            $context             доп. поля для шаблона письма/SMS (например, ['ORDER_ID' => 123]);
-     *                                               для Throwable - LOG_TYPE, если нужно его проставить явно
+     *                                               LOG_TYPE задаёт метку типа (в т.ч. произвольную, вроде имени модуля)
      * @return void
      * @author Pavel Shulaev (https://rover-it.me)
      */
     public static function report($messageOrException, array $context = []): void
     {
-        if ($messageOrException instanceof Throwable) {
-            static::notify($messageOrException, $context['LOG_TYPE'] ?? '');
+        if (!Options::isEnabled()) {
             return;
         }
 
-        static::send(static::buildFieldsFromMessage((string)$messageOrException, $context));
+        // источник не задан явно - определяем по вызывающему коду, чтобы модулям
+        // не приходилось подписываться вручную
+        if (!isset($context['SOURCE']) || $context['SOURCE'] === '') {
+            $context['SOURCE'] = Source::detectCaller();
+        }
+
+        if ($messageOrException instanceof Throwable) {
+            static::handle($messageOrException, $context['LOG_TYPE'] ?? '', $context);
+            return;
+        }
+
+        static::handleMessage((string)$messageOrException, $context);
+    }
+
+    /**
+     * Тот же маршрут, что и handle(), но для сообщения без исключения.
+     *
+     * @param string $message
+     * @param array  $context
+     * @return void
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function handleMessage(string $message, array $context): void
+    {
+        $logType = $context['LOG_TYPE'] ?? '';
+
+        if (!Options::isGroupingEnabled() || static::isCriticalLogType($logType)) {
+            static::send(static::buildFieldsFromMessage($message, $context));
+            return;
+        }
+
+        static::enqueueData([
+            'CLASS'    => '',
+            'MESSAGE'  => $message,
+            'CODE'     => (string)($context['CODE'] ?? ''),
+            'FILE'     => (string)($context['FILE'] ?? ''),
+            'LINE'     => (int)($context['LINE'] ?? 0),
+            'TRACE'    => (string)($context['TRACE'] ?? ''),
+            'LOG_TYPE' => (string)$logType,
+            'SOURCE'   => (string)($context['SOURCE'] ?? Source::getCoreName()),
+        ], $context);
     }
 
     /**
      * @param Throwable $exception
      * @param mixed     $logType
+     * @param array     $context
      * @return void
      * @author Pavel Shulaev (https://rover-it.me)
      */
-    public static function notify(Throwable $exception, $logType = ''): void
+    public static function notify(Throwable $exception, $logType = '', array $context = []): void
     {
-        static::send(static::buildFields($exception, $logType));
+        static::send(static::buildFields($exception, $logType, $context));
     }
 
     /**
@@ -95,26 +149,110 @@ class Notifier
      * @return bool
      * @author Pavel Shulaev (https://rover-it.me)
      */
-    protected static function isCriticalLogType(int $logType): bool
+    protected static function isCriticalLogType($logType): bool
     {
         if (!Options::isCriticalImmediate('Y')) {
             return false;
         }
 
-        return in_array($logType, [ExceptionHandlerLog::FATAL, ExceptionHandlerLog::UNCAUGHT_EXCEPTION], true);
+        // критичность определена только для числовых типов ядра; произвольная метка
+        // из report() (например, имя модуля) критичной не считается
+        if (!static::isCoreLogType($logType)) {
+            return false;
+        }
+
+        return in_array((int)$logType, [ExceptionHandlerLog::FATAL, ExceptionHandlerLog::UNCAUGHT_EXCEPTION], true);
+    }
+
+    /**
+     * @param mixed $logType
+     * @return bool
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function isCoreLogType($logType): bool
+    {
+        return is_int($logType) || (is_string($logType) && $logType !== '' && ctype_digit($logType));
+    }
+
+    /**
+     * Незаполненные CODE/FILE/LINE/TRACE (их не бывает у сообщений из report() без контекста)
+     * заменяем понятной заглушкой, чтобы в письме не было "Message: текст ()" и "line 0".
+     *
+     * @param mixed $value
+     * @return string
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function valueOrNotSet($value): string
+    {
+        // 0 для CODE и LINE означает "не задано" ровно так же, как пустая строка
+        if (empty($value)) {
+            return Loc::getMessage('rv-notifier__not_set') ?: 'not specified';
+        }
+
+        return (string)$value;
+    }
+
+    /**
+     * Ядро отдаёт тип лога числом (см. константы ExceptionHandlerLog), в письме/SMS от него
+     * толку нет - переводим в читаемое имя (FATAL, UNCAUGHT_EXCEPTION и т.д.).
+     * Произвольную метку, переданную в report(), отдаём как есть.
+     *
+     * @param mixed $logType
+     * @return string
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function formatLogType($logType): string
+    {
+        // report() без указания типа. Сравнение строгое: UNCAUGHT_EXCEPTION - это 0,
+        // и empty()/нестрогая проверка ошибочно посчитали бы его незаполненным
+        if ($logType === '' || $logType === null) {
+            return static::valueOrNotSet('');
+        }
+
+        if (!static::isCoreLogType($logType)) {
+            return (string)$logType;
+        }
+
+        return (string)ExceptionHandlerLog::logTypeToString((int)$logType);
     }
 
     /**
      * @param Throwable $exception
      * @param mixed     $logType
+     * @param array     $context
      * @return void
      * @author Pavel Shulaev (https://rover-it.me)
      */
-    protected static function enqueue(Throwable $exception, $logType): void
+    protected static function enqueue(Throwable $exception, $logType, array $context = []): void
     {
-        $hash = md5(get_class($exception) . '|' . $exception->getMessage() . '|' . $exception->getFile() . '|' .
-            $exception->getLine());
-        $now = new DateTime();
+        static::enqueueData([
+            'CLASS'    => get_class($exception),
+            'MESSAGE'  => $exception->getMessage(),
+            'CODE'     => (string)$exception->getCode(),
+            'FILE'     => $exception->getFile(),
+            'LINE'     => $exception->getLine(),
+            'TRACE'    => $exception->getTraceAsString(),
+            'LOG_TYPE' => (string)$logType,
+            'SOURCE'   => (string)($context['SOURCE'] ?? Source::detect($exception->getFile())),
+        ], $context);
+    }
+
+    /**
+     * @param array $data    CLASS/MESSAGE/FILE/LINE/TRACE/LOG_TYPE
+     * @param array $context произвольные поля шаблона, переживают очередь в колонке DATA
+     * @return void
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function enqueueData(array $data, array $context = []): void
+    {
+        $extra = array_diff_key($context, array_flip(self::RESERVED_FIELDS));
+
+        // LOG_TYPE и SOURCE в хэше: одинаковый текст из разных источников или с разными
+        // метками не должен слипаться; произвольные поля - чтобы не потерять контекст
+        // первой попавшей в группу записи
+        $hash = md5($data['CLASS'] . '|' . $data['MESSAGE'] . '|' . $data['CODE'] . '|' . $data['FILE'] . '|' .
+            $data['LINE'] . '|' . $data['LOG_TYPE'] . '|' . $data['SOURCE'] . '|' . serialize($extra));
+        $now  = new DateTime();
 
         $existing = ErrorTable::getList([
             'filter' => ['=HASH' => $hash],
@@ -126,7 +264,7 @@ class Notifier
             ErrorTable::update($existing['ID'], [
                 'CNT'       => $existing['CNT'] + 1,
                 'DATE_LAST' => $now,
-                'TRACE'     => $exception->getTraceAsString(),
+                'TRACE'     => $data['TRACE'],
             ]);
 
             return;
@@ -134,15 +272,32 @@ class Notifier
 
         ErrorTable::add([
             'HASH'       => $hash,
-            'MESSAGE'    => mb_substr($exception->getMessage(), 0, 255),
-            'FILE'       => mb_substr($exception->getFile(), 0, 255),
-            'LINE'       => $exception->getLine(),
-            'LOG_TYPE'   => (string)$logType,
-            'TRACE'      => $exception->getTraceAsString(),
+            'MESSAGE'    => mb_substr($data['MESSAGE'], 0, 255),
+            'CODE'       => mb_substr($data['CODE'], 0, 50),
+            'FILE'       => mb_substr($data['FILE'], 0, 255),
+            'LINE'       => (int)$data['LINE'],
+            'LOG_TYPE'   => mb_substr($data['LOG_TYPE'], 0, 50),
+            'SOURCE'     => mb_substr($data['SOURCE'], 0, 255),
+            'TRACE'      => $data['TRACE'],
+            'DATA'       => $extra ? static::encodeExtra($extra) : '',
             'DATE_FIRST' => $now,
             'DATE_LAST'  => $now,
             'CNT'        => 1,
         ]);
+    }
+
+    /**
+     * @param array $extra
+     * @return string
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function encodeExtra(array $extra): string
+    {
+        try {
+            return Json::encode($extra);
+        } catch (Throwable $e) {
+            return '';
+        }
     }
 
     /**
@@ -151,19 +306,23 @@ class Notifier
      * @return array
      * @author Pavel Shulaev (https://rover-it.me)
      */
-    protected static function buildFields(Throwable $exception, $logType): array
+    protected static function buildFields(Throwable $exception, $logType, array $context = []): array
     {
-        return [
+        // LOG_TYPE формируем сами (число ядра -> имя константы), из контекста его исключаем
+        unset($context['LOG_TYPE']);
+
+        return array_merge([
             'MESSAGE'  => $exception->getMessage(),
-            'CODE'     => (string)$exception->getCode(),
-            'FILE'     => $exception->getFile(),
-            'LINE'     => (string)$exception->getLine(),
-            'TRACE'    => $exception->getTraceAsString(),
-            'LOG_TYPE' => (string)$logType,
+            'CODE'     => static::valueOrNotSet($exception->getCode()),
+            'FILE'     => static::valueOrNotSet($exception->getFile()),
+            'LINE'     => static::valueOrNotSet($exception->getLine()),
+            'TRACE'    => static::valueOrNotSet($exception->getTraceAsString()),
+            'LOG_TYPE' => static::formatLogType($logType),
+            'SOURCE'   => Source::detect($exception->getFile()),
             'HOST'     => $_SERVER['HTTP_HOST'] ?? '',
             'COUNT'    => '1',
             'DATE'     => (string)(new DateTime()),
-        ];
+        ], $context);
     }
 
     /**
@@ -173,17 +332,36 @@ class Notifier
      */
     protected static function buildFieldsFromRow(array $row): array
     {
-        return [
+        return array_merge([
             'MESSAGE'  => $row['MESSAGE'],
-            'CODE'     => '',
-            'FILE'     => $row['FILE'],
-            'LINE'     => (string)$row['LINE'],
-            'TRACE'    => (string)$row['TRACE'],
-            'LOG_TYPE' => (string)$row['LOG_TYPE'],
+            'CODE'     => static::valueOrNotSet($row['CODE'] ?? ''),
+            'FILE'     => static::valueOrNotSet($row['FILE']),
+            'LINE'     => static::valueOrNotSet($row['LINE']),
+            'TRACE'    => static::valueOrNotSet($row['TRACE']),
+            'LOG_TYPE' => static::formatLogType($row['LOG_TYPE']),
+            'SOURCE'   => (string)(($row['SOURCE'] ?? '') ?: Source::getCoreName()),
             'HOST'     => $_SERVER['HTTP_HOST'] ?? '',
             'COUNT'    => (string)$row['CNT'],
             'DATE'     => (string)$row['DATE_LAST'],
-        ];
+        ], static::decodeExtra($row['DATA'] ?? ''));
+    }
+
+    /**
+     * @param string $data
+     * @return array
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    protected static function decodeExtra($data): array
+    {
+        if (empty($data)) {
+            return [];
+        }
+
+        try {
+            return (array)Json::decode((string)$data);
+        } catch (Throwable $e) {
+            return [];
+        }
     }
 
     /**
@@ -194,13 +372,23 @@ class Notifier
      */
     protected static function buildFieldsFromMessage(string $message, array $context): array
     {
+        // CODE/FILE/LINE/TRACE берём из контекста, если переданы, иначе - заглушка;
+        // из $context их убираем, чтобы array_merge не вернул пустые значения обратно
+        $logType = $context['LOG_TYPE'] ?? '';
+        $code    = $context['CODE'] ?? '';
+        $file    = $context['FILE'] ?? '';
+        $line    = $context['LINE'] ?? '';
+        $trace   = $context['TRACE'] ?? '';
+        unset($context['LOG_TYPE'], $context['CODE'], $context['FILE'], $context['LINE'], $context['TRACE']);
+
         return array_merge([
             'MESSAGE'  => $message,
-            'CODE'     => '',
-            'FILE'     => '',
-            'LINE'     => '',
-            'TRACE'    => '',
-            'LOG_TYPE' => '',
+            'CODE'     => static::valueOrNotSet($code),
+            'FILE'     => static::valueOrNotSet($file),
+            'LINE'     => static::valueOrNotSet($line),
+            'TRACE'    => static::valueOrNotSet($trace),
+            'LOG_TYPE' => static::formatLogType($logType),
+            'SOURCE'   => Source::getCoreName(),
             'HOST'     => $_SERVER['HTTP_HOST'] ?? '',
             'COUNT'    => '1',
             'DATE'     => (string)(new DateTime()),

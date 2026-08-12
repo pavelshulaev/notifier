@@ -45,6 +45,9 @@ class ErrorTable extends DataManager
             (new StringField('MESSAGE'))
                 ->configureSize(255),
 
+            (new StringField('CODE'))
+                ->configureSize(50),
+
             (new StringField('FILE'))
                 ->configureSize(255),
 
@@ -53,7 +56,14 @@ class ErrorTable extends DataManager
             (new StringField('LOG_TYPE'))
                 ->configureSize(50),
 
+            (new StringField('SOURCE'))
+                ->configureSize(255),
+
             (new TextField('TRACE')),
+
+            // JSON с произвольными полями, переданными в Notifier::report() через $context:
+            // без него при включённой группировке кастомные плейсхолдеры шаблона потерялись бы
+            (new TextField('DATA')),
 
             (new DatetimeField('DATE_FIRST')),
 
