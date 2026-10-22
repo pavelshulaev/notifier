@@ -21,6 +21,29 @@ use Rover\Notifier\Options;
 class RoverNotifier extends FileExceptionHandlerLog
 {
     /**
+     * Защита от повторного входа.
+     *
+     * Записать строку в файл обработчик может сколько угодно раз, а всё, что
+     * ходит в базу, кеш и каналы оповещения, выполняется один раз на хит.
+     *
+     * Без этого флага обработчик зацикливается: Loader::includeModule() в
+     * write() сам идёт в ORM и управляемый кеш, и если недоступны кеш-сервер
+     * или база, этот вызов снова порождает ошибку — ядро снова зовёт write(),
+     * и так до падения хита по памяти. Константа ROVER_NOTIFIER_HIT_SEND от
+     * этого не спасает: она объявляется уже после includeModule(), то есть
+     * после того самого вызова, который рекурсирует. try/catch вокруг
+     * Notifier::handle() тоже не помогает — повторный вход приходит из ядра,
+     * мимо всех catch.
+     *
+     * Случай из практики: после обновления пакетов сервисы поднимались по
+     * очереди, веб-сервер уже обслуживал запросы, а memcached и база ещё нет —
+     * за 47 секунд такой цикл записал 820 КБ трейсов в лог исключений.
+     *
+     * @var bool
+     */
+    private static $inside = false;
+
+    /**
      * @return void
      * @throws ArgumentException
      * @throws ObjectPropertyException
@@ -69,8 +92,34 @@ class RoverNotifier extends FileExceptionHandlerLog
      */
     public function write($exception, $logType): void
     {
+        // Файловый лог: ни базы, ни кеша, поэтому пишем всегда.
         parent::write($exception, $logType);
 
+        if (self::$inside) {
+            return;
+        }
+
+        self::$inside = true;
+
+        try {
+            $this->notify($exception, $logType);
+        } finally {
+            self::$inside = false;
+        }
+    }
+
+    /**
+     * @param $exception
+     * @param $logType
+     * @return void
+     * @throws ArgumentException
+     * @throws ObjectPropertyException
+     * @throws SystemException
+     * @throws LoaderException
+     * @author Pavel Shulaev (https://rover-it.me)
+     */
+    private function notify($exception, $logType): void
+    {
         if (!Loader::includeModule('rover.notifier')) {
             return;
         }
